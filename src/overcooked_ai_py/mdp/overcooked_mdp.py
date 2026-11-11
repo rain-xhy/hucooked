@@ -1055,6 +1055,12 @@ EVENT_TYPES = [
     "catastrophic_tomato_potting",
     "useless_onion_potting",
     "useless_tomato_potting",
+    # Synchronous handoff events (one boolean per player, per step).
+    "sync_handoff_attempt",
+    "sync_handoff_success",
+    "sync_handoff_give",
+    "sync_handoff_receive",
+    "sync_handoff_wait",
 ]
 
 POTENTIAL_CONSTANTS = {
@@ -1104,7 +1110,7 @@ class OvercookedGridworld(object):
         """
         terrain: a matrix of strings that encode the MDP layout
         layout_name: string identifier of the layout
-        start_player_positions: tuple of positions for both players' starting positions
+        start_player_positions: positions for all players' starting positions
         start_bonus_orders: List of recipes dicts that are worth a bonus
         rew_shaping_params: reward given for completion of specific subgoals
         all_orders: List of all available order dicts the players can make, defaults to all possible recipes if empy list provided
@@ -1288,6 +1294,8 @@ class OvercookedGridworld(object):
         return Action.ALL_ACTIONS
 
     def _check_action(self, state, joint_action):
+        if len(joint_action) != self.num_players:
+            raise ValueError("Expected one action per player")
         for p_action, p_legal_actions in zip(
             joint_action, self.get_actions(state)
         ):
@@ -1387,6 +1395,12 @@ class OvercookedGridworld(object):
         events_infos = {
             event: [False] * self.num_players for event in EVENT_TYPES
         }
+        if len(joint_action) != self.num_players:
+            raise ValueError(
+                "Expected {} actions, received {}".format(
+                    self.num_players, len(joint_action)
+                )
+            )
         assert not self.is_terminal(
             state
         ), "Trying to find successor of a terminal state: {}".format(state)
@@ -1398,11 +1412,14 @@ class OvercookedGridworld(object):
                 )
 
         new_state = state.deepcopy()
+        handoff_events = []
         # Resolve interacts first
         (
             sparse_reward_by_agent,
             shaped_reward_by_agent,
-        ) = self.resolve_interacts(new_state, joint_action, events_infos)
+        ) = self.resolve_interacts(
+            new_state, joint_action, events_infos, handoff_events
+        )
         assert new_state.player_positions == state.player_positions
         assert new_state.player_orientations == state.player_orientations
 
@@ -1418,6 +1435,7 @@ class OvercookedGridworld(object):
             "event_infos": events_infos,
             "sparse_reward_by_agent": sparse_reward_by_agent,
             "shaped_reward_by_agent": shaped_reward_by_agent,
+            "sync_handoffs": handoff_events,
         }
         if display_phi:
             assert (
@@ -1429,13 +1447,89 @@ class OvercookedGridworld(object):
             )
         return new_state, infos
 
-    def resolve_interacts(self, new_state, joint_action, events_infos):
+    def resolve_sync_handoffs(self, state, joint_action, events_infos):
+        """Resolve H stations atomically using the pre-interaction state.
+
+        A station has exactly two opposite walkable neighbors. Both players
+        must already face it, both must INTERACT on this step, and exactly
+        one must hold an object. H stations never store objects or pay rewards.
+        """
+        handoff_events = []
+        for station in self.get_sync_handoff_locations():
+            participants = [
+                i
+                for i, player in enumerate(state.players)
+                if Action.move_in_direction(player.position, player.orientation)
+                == station
+            ]
+            attempting = [
+                i for i in participants if joint_action[i] == Action.INTERACT
+            ]
+            for i in attempting:
+                events_infos["sync_handoff_attempt"][i] = True
+
+            success = False
+            sender = receiver = None
+            reason = "waiting_for_partner"
+            if len(participants) == 2:
+                if len(attempting) != 2:
+                    reason = "not_simultaneous"
+                else:
+                    holders = [
+                        i for i in participants if state.players[i].has_object()
+                    ]
+                    if len(holders) == 0:
+                        reason = "both_empty"
+                    elif len(holders) == 2:
+                        reason = "both_holding"
+                    else:
+                        sender = holders[0]
+                        receiver = next(i for i in participants if i != sender)
+                        state.players[receiver].set_object(
+                            state.players[sender].remove_object()
+                        )
+                        events_infos["sync_handoff_give"][sender] = True
+                        events_infos["sync_handoff_receive"][receiver] = True
+                        for i in participants:
+                            events_infos["sync_handoff_success"][i] = True
+                        success = True
+                        reason = "success"
+
+            # Waiting is counted in agent-steps, including unsuccessful presses.
+            if not success:
+                for i in participants:
+                    if joint_action[i] in (Action.STAY, Action.INTERACT):
+                        events_infos["sync_handoff_wait"][i] = True
+            # One record per station-step with at least one INTERACT, so a
+            # successful two-person transfer is counted only once in metrics.
+            if attempting:
+                handoff_events.append(
+                    {
+                        "station": station,
+                        "participants": participants,
+                        "attempting_agents": attempting,
+                        "success": success,
+                        "reason": reason,
+                        "sender": sender,
+                        "receiver": receiver,
+                    }
+                )
+        return handoff_events
+
+    def resolve_interacts(
+        self, new_state, joint_action, events_infos, handoff_events=None
+    ):
         """
         Resolve any INTERACT actions, if present.
 
-        Currently if two players both interact with a terrain, we resolve player 1's interact
-        first and then player 2's, without doing anything like collision checking.
+        H stations are resolved jointly before ordinary interactions. For the
+        original terrain types, interactions keep their original player order.
         """
+        resolved_handoffs = self.resolve_sync_handoffs(
+            new_state, joint_action, events_infos
+        )
+        if handoff_events is not None:
+            handoff_events.extend(resolved_handoffs)
         pot_states = self.get_pot_states(new_state)
         # We divide reward by agent to keep track of who contributed
         sparse_reward, shaped_reward = (
@@ -1802,6 +1896,9 @@ class OvercookedGridworld(object):
     def get_counter_locations(self):
         return list(self.terrain_pos_dict["X"])
 
+    def get_sync_handoff_locations(self):
+        return list(self.terrain_pos_dict["H"])
+
     @property
     def num_pots(self):
         return len(self.get_pot_locations())
@@ -1917,6 +2014,7 @@ class OvercookedGridworld(object):
         - No two players or non-held objects occupy the same position
         - Objects have a valid state (eg. no pot with 4 onions)
         """
+        assert len(state.players) == self.num_players, "Wrong number of players"
         all_objects = list(state.objects.values())
         for player_state in state.players:
             # Check that players are not on terrain
@@ -1936,6 +2034,9 @@ class OvercookedGridworld(object):
             assert obj_state.position == obj_pos
             # Check that non-held objects are on terrain
             assert self.get_terrain_type_at_pos(obj_pos) != " "
+            assert self.get_terrain_type_at_pos(obj_pos) != "H", (
+                "Synchronous handoff stations cannot store objects"
+            )
 
         # Check that players and non-held objects don't overlap
         all_pos = [player_state.position for player_state in state.players]
@@ -2068,7 +2169,7 @@ class OvercookedGridworld(object):
         certain height and width. grid[y][x] is the space at row y and column
         x. A space must be either 'X' (representing a counter), ' ' (an empty
         space), 'O' (onion supply), 'P' (pot), 'D' (dish supply), 'S' (serving
-        location), '1' (player 1) and '2' (player 2).
+        location), 'H' (synchronous handoff), and '1'..'9' (players).
         """
         height = len(grid)
         width = len(grid[0])
@@ -2078,7 +2179,7 @@ class OvercookedGridworld(object):
 
         # Borders must not be free spaces
         def is_not_free(c):
-            return c in "XOPDST"
+            return c in "XOPDSTH"
 
         for y in range(height):
             assert is_not_free(grid[y][0]), "Left border must not be free"
@@ -2098,8 +2199,22 @@ class OvercookedGridworld(object):
         ), "Some players were missing"
 
         assert all(
-            c in "XOPDST123456789 " for c in all_elements
+            c in "XOPDSTH123456789 " for c in all_elements
         ), "Invalid character in grid"
+        for y, row in enumerate(grid):
+            for x, terrain in enumerate(row):
+                if terrain != "H":
+                    continue
+                access = [
+                    (dx, dy)
+                    for dx, dy in Direction.ALL_DIRECTIONS
+                    if 0 <= x + dx < width and 0 <= y + dy < height
+                    and grid[y + dy][x + dx] in " 123456789"
+                ]
+                assert len(access) == 2 and (
+                    access[0][0] + access[1][0],
+                    access[0][1] + access[1][1],
+                ) == (0, 0), "H needs exactly two opposite walkable neighbors"
         assert all_elements.count("1") == 1, "'1' must be present exactly once"
         assert (
             all_elements.count("D") >= 1
@@ -2377,18 +2492,21 @@ class OvercookedGridworld(object):
             "Using the `lossless_state_encoding_shape` property is deprecated. Please use `get_lossless_state_encoding_shape` method instead",
             DeprecationWarning,
         )
-        return np.array(list(self.shape) + [26])
+        return self.get_lossless_state_encoding_shape()
 
     def get_lossless_state_encoding_shape(self):
-        return np.array(list(self.shape) + [26])
+        # Five player channels each, plus the original sixteen other channels.
+        # Only H layouts get an extra static H plane, preserving old encodings.
+        channels = (
+            5 * self.num_players + 16 + bool(self.get_sync_handoff_locations())
+        )
+        return np.array(list(self.shape) + [channels])
 
     def lossless_state_encoding(
         self, overcooked_state, horizon=400, debug=False
     ):
         """Featurizes a OvercookedState object into a stack of boolean masks that are easily readable by a CNN"""
-        assert (
-            self.num_players == 2
-        ), "Functionality has to be added to support encondings for > 2 players"
+        assert len(overcooked_state.players) == self.num_players
         assert type(debug) is bool
         base_map_features = [
             "pot_loc",
@@ -2398,6 +2516,8 @@ class OvercookedGridworld(object):
             "dish_disp_loc",
             "serve_loc",
         ]
+        if self.get_sync_handoff_locations():
+            base_map_features.append("sync_handoff_loc")
         variable_map_features = [
             "onions_in_pot",
             "tomatoes_in_pot",
@@ -2418,17 +2538,18 @@ class OvercookedGridworld(object):
             return layer
 
         def process_for_player(primary_agent_idx):
-            # Ensure that primary_agent_idx layers are ordered before other_agent_idx layers
-            other_agent_idx = 1 - primary_agent_idx
+            # Put this player's channels first, then teammates in index order.
+            ordered_players = [primary_agent_idx] + [
+                i for i in range(self.num_players) if i != primary_agent_idx
+            ]
             ordered_player_features = [
-                "player_{}_loc".format(primary_agent_idx),
-                "player_{}_loc".format(other_agent_idx),
+                "player_{}_loc".format(i) for i in ordered_players
             ] + [
                 "player_{}_orientation_{}".format(
                     i, Direction.DIRECTION_TO_INDEX[d]
                 )
                 for i, d in itertools.product(
-                    [primary_agent_idx, other_agent_idx],
+                    ordered_players,
                     Direction.ALL_DIRECTIONS,
                 )
             ]
@@ -2463,6 +2584,9 @@ class OvercookedGridworld(object):
 
             for loc in self.get_serving_locations():
                 state_mask_dict["serve_loc"][loc] = 1
+
+            for loc in self.get_sync_handoff_locations():
+                state_mask_dict["sync_handoff_loc"][loc] = 1
 
             # PLAYER LAYERS
             for i, player in enumerate(overcooked_state.players):

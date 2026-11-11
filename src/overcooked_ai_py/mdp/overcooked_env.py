@@ -91,6 +91,11 @@ class OvercookedEnv(object):
 
     @property
     def mlam(self):
+        if self.mdp.num_players != 2 or self.mdp.get_sync_handoff_locations():
+            raise NotImplementedError(
+                "The legacy medium-level planner does not support this layout. "
+                "Use joint actions and lossless_state_encoding_mdp for three-player/H kitchens."
+            )
         if self._mlam is None:
             if self.info_level > 0:
                 print("Computing MediumLevelActionManager")
@@ -254,9 +259,17 @@ class OvercookedEnv(object):
         """
         assert not self.is_done()
         if joint_agent_action_info is None:
-            joint_agent_action_info = [{}, {}]
+            joint_agent_action_info = [{} for _ in range(self.mdp.num_players)]
+        if len(joint_agent_action_info) != self.mdp.num_players:
+            raise ValueError("Expected one action-info dictionary per player")
+        if display_phi and (
+            self.mdp.num_players != 2 or self.mdp.get_sync_handoff_locations()
+        ):
+            raise NotImplementedError(
+                "Legacy potential shaping supports only ordinary two-player kitchens"
+            )
         next_state, mdp_infos = self.mdp.get_state_transition(
-            self.state, joint_action, display_phi, self.mp
+            self.state, joint_action, display_phi, self.mp if display_phi else None
         )
 
         # Update game_stats
@@ -352,6 +365,8 @@ class OvercookedEnv(object):
         # TODO: This can be further simplified by having all the mdp_infos copied over to the env_infos automatically
         env_info["sparse_r_by_agent"] = mdp_infos["sparse_reward_by_agent"]
         env_info["shaped_r_by_agent"] = mdp_infos["shaped_reward_by_agent"]
+        env_info["event_infos"] = mdp_infos["event_infos"]
+        env_info["sync_handoffs"] = mdp_infos.get("sync_handoffs", [])
         env_info["phi_s"] = (
             mdp_infos["phi_s"] if "phi_s" in mdp_infos else None
         )
@@ -467,7 +482,9 @@ class OvercookedEnv(object):
 
         # Add final state
         if include_final_state:
-            trajectory.append((s_tp1, (None, None), 0, True, None))
+            trajectory.append(
+                (s_tp1, (None,) * self.mdp.num_players, 0, True, None)
+            )
 
         total_sparse = sum(
             self.game_stats["cumulative_sparse_rewards_by_agent"]
