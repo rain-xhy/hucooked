@@ -22,10 +22,16 @@ class ParallelKitchen(ParallelEnv):
     metadata = {"name": "mixed_kitchen_v1", "render_modes": ["rgb_array"],
                 "is_parallelizable": True}
 
-    def __init__(self, config=None, render_mode=None):
+    def __init__(self, config=None, render_mode=None, *, device=None):
         if render_mode not in (None, "rgb_array"):
             raise ValueError("Only rgb_array rendering is supported")
-        self.core = MixedKitchen(config)
+        if device is None:
+            self.core = MixedKitchen(config)
+        else:
+            from .torch_kitchen import TorchMixedKitchen
+
+            self.core = TorchMixedKitchen(config, device=device)
+        self._tensor_backend = device is not None
         self.render_mode = render_mode
         self.possible_agents = ["chef_{}".format(i) for i in self.core.active]
         self.agents = self.possible_agents.copy()
@@ -46,6 +52,8 @@ class ParallelKitchen(ParallelEnv):
         if options is not None and not isinstance(options, dict):
             raise TypeError("reset options must be a dictionary")
         obs, info = self.core.reset(seed)
+        if self._tensor_backend:
+            obs, info = obs[0].cpu().numpy(), info.to_native()
         self.agents = self.possible_agents.copy()
         for i, agent in enumerate(self.possible_agents):
             self.action_spaces[agent].seed(None if seed is None else seed + i)
@@ -62,7 +70,12 @@ class ParallelKitchen(ParallelEnv):
         joint = [STAY] * 3
         for agent, action in actions.items():
             joint[int(agent.rsplit("_", 1)[1])] = action
-        obs, reward, terminal, truncated, info = self.core.step(joint)
+        if self._tensor_backend:
+            obs, reward, terminal, truncated, info = self.core.step([joint])
+            obs, reward = obs[0].cpu().numpy(), reward[0].item()
+            terminal, truncated, info = terminal[0].item(), truncated[0].item(), info.to_native()
+        else:
+            obs, reward, terminal, truncated, info = self.core.step(joint)
         live = self.agents.copy()
         result = (
             {a: obs[int(a.rsplit("_", 1)[1])] for a in live},
@@ -76,7 +89,8 @@ class ParallelKitchen(ParallelEnv):
         return result
 
     def state(self):
-        return self.core.centralized_state()
+        state = self.core.centralized_state()
+        return state[0].cpu().numpy() if self._tensor_backend else state
 
     def render(self):
         return self.core.render()

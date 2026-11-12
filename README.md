@@ -119,9 +119,37 @@ The existing CPU environment is the default when `device` is omitted. Use
 existing CPU agents. A custom Python `start_state_fn` also runs on the CPU when
 initializing or resetting a kitchen.
 
-The batched backend runs `OvercookedGridworld` layouts. The fixed-order
-`cooperative.MixedKitchen` environment and its `ParallelKitchen` wrapper
-use a separate CPU implementation.
+### Fixed-order MixedKitchen on a GPU
+
+`TorchMixedKitchen` runs a batch of the fixed-order task with the same
+`KitchenConfig`, seeded resets, and transition rules as `MixedKitchen`.
+
+```python
+import torch
+from overcooked_ai_py.cooperative.kitchen import STAY
+from overcooked_ai_py.cooperative.presets import preset
+from overcooked_ai_py.cooperative.torch_kitchen import TorchMixedKitchen
+
+env = TorchMixedKitchen(preset("standard_train"), device="cuda", num_envs=64)
+obs, info = env.reset(seed=42)
+actions = torch.full((env.num_envs, 3), STAY, device=env.device)
+obs, rewards, terminated, truncated, info = env.step(actions)
+env.reset(mask=terminated | truncated)
+```
+
+Observations have shape `[batch, 3, 187]` and rewards are shared by all active
+chefs in a kitchen. Inactive slots are ghosted. Finished lanes wait for a
+masked reset. An explicit seed initializes lane `i` with `seed + i`.
+Order draws use the native seeded generator at reset, so batch refreshes can
+consume them on the device. CUDA tensor actions synchronize a scalar range
+check before the transition. Use `info.to_native(lane)` for the original event
+and metric dictionaries, or `env.snapshot(lane)` and
+`env.restore(snapshot, lane=lane)` to exchange snapshots with the CPU task.
+
+`ParallelKitchen(config, device="cuda")` uses a single CUDA kitchen and
+returns the standard PettingZoo dictionaries with NumPy observations.
+Omitting `device` selects the native CPU implementation. Use
+`TorchMixedKitchen` directly when the policy consumes batched tensors.
 
 ## Code Structure Overview 🗺
 
