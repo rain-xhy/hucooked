@@ -14,6 +14,7 @@ TOMATO_DISPENSER = "T"
 POT = "P"
 DISH_DISPENSER = "D"
 SERVING_LOC = "S"
+SYNC_HANDOFF = "H"
 
 CODE_TO_TYPE = {
     0: EMPTY,
@@ -23,6 +24,7 @@ CODE_TO_TYPE = {
     4: POT,
     5: DISH_DISPENSER,
     6: SERVING_LOC,
+    7: SYNC_HANDOFF,
 }
 TYPE_TO_CODE = {v: k for k, v in CODE_TO_TYPE.items()}
 

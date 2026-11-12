@@ -25,6 +25,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+cooperative = ["pettingzoo>=1.27,<2"]
 harl = [
     "ipykernel",
     "ray[rllib,tune]==2.2",

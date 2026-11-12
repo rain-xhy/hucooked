@@ -12,6 +12,7 @@ from overcooked_ai_py.mdp.layout_generator import (
     ONION_DISPENSER,
     POT,
     SERVING_LOC,
+    SYNC_HANDOFF,
     TOMATO_DISPENSER,
 )
 from overcooked_ai_py.static import FONTS_DIR, GRAPHICS_DIR
@@ -60,7 +61,7 @@ class StateVisualizer:
         "width": None,  # if None use (hud_height+grid_height)
         "tile_size": 75,
         "window_fps": 30,
-        "player_colors": ["blue", "green"],
+        "player_colors": ["blue", "green", "red"],
         "is_rendering_hud": True,
         "hud_font_size": 10,
         "hud_font_path": roboto_path,
@@ -97,6 +98,7 @@ class StateVisualizer:
         POT: "pot",
         DISH_DISPENSER: "dishes",
         SERVING_LOC: "serve",
+        SYNC_HANDOFF: "counter",
     }
 
     def __init__(self, **kwargs):
@@ -353,6 +355,22 @@ class StateVisualizer:
                     self._position_in_unscaled_pixels((x_tile, y_tile)),
                     StateVisualizer.TILE_TO_FRAME_NAME[tile],
                 )
+                if tile == SYNC_HANDOFF:
+                    # A distinct cyan double arrow drawn on the existing counter sprite.
+                    px, py = self._position_in_unscaled_pixels((x_tile, y_tile))
+                    color = (40, 230, 240)
+                    pygame.draw.rect(surface, color, (px + 1, py + 1, 13, 13), 1)
+                    pygame.draw.line(
+                        surface, color, (px + 3, py + 7), (px + 11, py + 7), 2
+                    )
+                    pygame.draw.lines(
+                        surface, color, False,
+                        [(px + 5, py + 4), (px + 2, py + 7), (px + 5, py + 10)]
+                    )
+                    pygame.draw.lines(
+                        surface, color, False,
+                        [(px + 9, py + 4), (px + 12, py + 7), (px + 9, py + 10)]
+                    )
 
     def _position_in_unscaled_pixels(self, position):
         """
