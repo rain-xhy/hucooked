@@ -103,13 +103,25 @@ env.reset(mask=done)
 
 `step` returns the sparse team reward per kitchen. The info dictionary also
 contains per-player rewards, step events, and episode totals. Finished kitchens
-wait for a reset. For two players, the lossless observation has shape
-`[num_envs, 2, width, height, 26]` and uses the native channel order.
+wait for a reset. The lossless observation has shape
+`[num_envs, num_players, width, height, channels]` and uses the native channel
+order. A layout has five channels per player, 16 common channels, and an extra
+terrain channel if it contains synchronous handoff stations (`H`).
+
+On an `H` layout, two players facing the same station transfer an item when
+both interact in the same step and exactly one holds an item.
+`info["events"]` contains the per-player handoff flags on the device. Use
+`info["sync_handoffs"].to_native(lane)` to read one kitchen's station-level
+diagnostics as native MDP records.
 
 The existing CPU environment is the default when `device` is omitted. Use
 `env.to_native_state(lane)` to copy a single kitchen to the CPU for rendering or
 existing CPU agents. A custom Python `start_state_fn` also runs on the CPU when
 initializing or resetting a kitchen.
+
+The batched backend runs `OvercookedGridworld` layouts. The fixed-order
+`cooperative.MixedKitchen` environment and its `ParallelKitchen` wrapper
+use a separate CPU implementation.
 
 ## Code Structure Overview 🗺
 

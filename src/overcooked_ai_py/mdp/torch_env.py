@@ -15,11 +15,13 @@ from overcooked_ai_py.mdp.overcooked_mdp import (
 )
 
 
-FLOOR, COUNTER, ONION_SOURCE, TOMATO_SOURCE, DISH_SOURCE, POT, SERVING = range(7)
+TERRAIN = " XOTDPSH"
+FLOOR, COUNTER, ONION_SOURCE, TOMATO_SOURCE, DISH_SOURCE, POT, SERVING, HANDOFF = range(len(TERRAIN))
 EMPTY, ONION, TOMATO, DISH, SOUP = range(5)
 ITEM_NAMES = (None, "onion", "tomato", "dish", "soup")
 KIND, COOK_TICK, COOK_OVERRIDE, INGREDIENTS = range(4)
 INTERACT_INDEX = Action.ACTION_TO_INDEX[Action.INTERACT]
+STAY_INDEX = Action.ACTION_TO_INDEX[Action.STAY]
 
 
 class TorchOvercookedState(NamedTuple):
@@ -34,6 +36,48 @@ class TorchOvercookedState(NamedTuple):
     objects: torch.Tensor
     held_objects: torch.Tensor
     timestep: torch.Tensor
+
+
+class TorchHandoffEvents(NamedTuple):
+    """Station coordinates and device-side masks shaped [batch, station, player]."""
+
+    stations: tuple
+    participants: torch.Tensor
+    attempting: torch.Tensor
+    holding: torch.Tensor
+    giving: torch.Tensor
+    receiving: torch.Tensor
+
+    def to_native(self, lane=0):
+        """Copy one lane's attempted handoffs to native MDP diagnostic records."""
+        if not self.stations:
+            return []
+        masks = torch.stack(self[1:])[:, lane].tolist()
+        records = []
+        for station, player_masks in zip(self.stations, zip(*masks)):
+            participants, attempting, holding, giving, receiving = (
+                [i for i, flag in enumerate(mask) if flag] for mask in player_masks
+            )
+            if not attempting:
+                continue
+            if giving:
+                reason = "success"
+            elif len(participants) != 2:
+                reason = "waiting_for_partner"
+            elif len(attempting) != 2:
+                reason = "not_simultaneous"
+            else:
+                reason = "both_holding" if holding else "both_empty"
+            records.append({
+                "station": station,
+                "participants": participants,
+                "attempting_agents": attempting,
+                "success": bool(giving),
+                "reason": reason,
+                "sender": giving[0] if giving else None,
+                "receiver": receiving[0] if receiving else None,
+            })
+        return records
 
 
 class TorchOvercookedEnv:
@@ -56,7 +100,7 @@ class TorchOvercookedEnv:
                          for onions in range(self._max_ingredients + 1)
                          for tomatoes in range(self._max_ingredients - onions + 1) if onions + tomatoes]
         self._empty_item = [EMPTY, -1, -1, *([EMPTY] * self._max_ingredients)]
-        self._tiles = self._tensor([" XOTDPS".index(tile) for row in mdp.terrain_mtx for tile in row])
+        self._tiles = self._tensor([TERRAIN.index(tile) for row in mdp.terrain_mtx for tile in row])
         self._cells = torch.arange(self.width * self.height, device=self.device)
         self._rows = torch.arange(num_envs, device=self.device)
         self._directions = torch.arange(len(Direction.ALL_DIRECTIONS), device=self.device)
@@ -65,8 +109,19 @@ class TorchOvercookedEnv:
         neighbors = neighbors.clamp_min(0).minimum(self._tensor((self.width - 1, self.height - 1)))
         self._neighbors = neighbors[..., 0] + self.width * neighbors[..., 1]
         self._pair_a, self._pair_b = torch.triu_indices(self.num_players, self.num_players, 1, device=self.device)
-        self._static_layers = self._tiles == self._tensor((POT, COUNTER, ONION_SOURCE, TOMATO_SOURCE,
-                                                         DISH_SOURCE, SERVING))[:, None]
+        self._handoff_stations = tuple(mdp.get_sync_handoff_locations())
+        self._handoff_cells = self._tensor([self._flat(station) for station in self._handoff_stations])
+        empty_mask = torch.zeros((num_envs, 0, self.num_players), dtype=torch.bool, device=self.device)
+        self._empty_handoffs = TorchHandoffEvents((), empty_mask, empty_mask, empty_mask, empty_mask, empty_mask)
+        terrain_layers = [POT, COUNTER, ONION_SOURCE, TOMATO_SOURCE, DISH_SOURCE, SERVING]
+        if self._handoff_stations:
+            terrain_layers.append(HANDOFF)
+        self._static_layers = self._tiles == self._tensor(terrain_layers)[:, None]
+        self._view_order = self._tensor([
+            [player, *(peer for peer in range(self.num_players) if peer != player)]
+            for player in range(self.num_players)
+        ])
+        self._observation_channels = int(mdp.get_lossless_state_encoding_shape()[-1])
         self._cook_times = self._recipe_matrix(lambda _onions, _tomatoes, recipe: recipe.time)
         self._shaping = self._tensor(
             [mdp.reward_shaping_params[key] for key in (
@@ -113,6 +168,7 @@ class TorchOvercookedEnv:
         return data
 
     def _encode_start(self, native):
+        self.mdp._check_valid_state(native)
         objects = [self._empty_item] * (self.width * self.height)
         for position, item in native.objects.items():
             objects[self._flat(position)] = self._encode_item(item)
@@ -176,6 +232,28 @@ class TorchOvercookedEnv:
         onions, tomatoes = self._ingredient_counts(items)
         override = items[..., COOK_OVERRIDE]
         return torch.where(override >= 0, override, self._cook_times[onions, tomatoes])
+
+    def _resolve_sync_handoffs(self, target, active, interact, held):
+        participants = (target[:, None] == self._handoff_cells[:, None]) & active[:, None, None]
+        attempting = participants & interact[:, None]
+        holding = participants & (held[:, None, :, KIND] != EMPTY)
+        success = (
+            (participants.sum(dim=2, keepdim=True) == 2)
+            & (attempting.sum(dim=2, keepdim=True) == 2)
+            & (holding.sum(dim=2, keepdim=True) == 1)
+        )
+        giving = success & holding
+        receiving = success & participants & ~holding
+
+        # A player faces at most one station. Gather all transfers from the
+        # same held-object snapshot before assigning either side of a handoff.
+        sender = giving.long().argmax(dim=2)
+        transfers = held[self._rows[:, None], sender]
+        receiver_station = receiving.long().argmax(dim=1)
+        received = transfers[self._rows[:, None], receiver_station]
+        remaining = torch.where(giving.any(dim=1, keepdim=False).unsqueeze(2), self._empty, held)
+        held.copy_(torch.where(receiving.any(dim=1).unsqueeze(2), received, remaining))
+        return TorchHandoffEvents(self._handoff_stations, participants, attempting, holding, giving, receiving)
 
     def _interact(self, player, target, interact, objects, held, full_pots, nonempty_pots):
         tile = self._tiles[target]
@@ -271,7 +349,11 @@ class TorchOvercookedEnv:
         full_pots = pot_mask & (cooking | (pot_count == self._max_ingredients))
         nonempty_pots = (pot_mask & (cooking | ((pot_count > 0) & ~full_pots))).sum(dim=1)
         target = self._neighbors[positions, orientations]
-        player_results = [self._interact(player, target[:, player], active & (actions[:, player] == INTERACT_INDEX),
+        interact = active[:, None] & (actions == INTERACT_INDEX)
+        handoffs = self._empty_handoffs
+        if self._handoff_stations:
+            handoffs = self._resolve_sync_handoffs(target, active, interact, held)
+        player_results = [self._interact(player, target[:, player], interact[:, player],
                                         objects, held, full_pots, nonempty_pots)
                           for player in range(self.num_players)]
 
@@ -296,8 +378,20 @@ class TorchOvercookedEnv:
         self._sparse_total = self._sparse_total + sparse
         self._shaped_total = self._shaped_total + shaped
         false = torch.zeros_like(active)
+        event_infos = {key: torch.stack([event.get(key, false) for event in events], dim=1) for key in EVENT_TYPES}
+        if self._handoff_stations:
+            giving = handoffs.giving.any(dim=1)
+            receiving = handoffs.receiving.any(dim=1)
+            unsuccessful = handoffs.participants & ~handoffs.giving.any(dim=2, keepdim=True)
+            event_infos.update(
+                sync_handoff_attempt=handoffs.attempting.any(dim=1),
+                sync_handoff_success=giving | receiving,
+                sync_handoff_give=giving,
+                sync_handoff_receive=receiving,
+                sync_handoff_wait=unsuccessful.any(dim=1) & (interact | (actions == STAY_INDEX)),
+            )
         info = {"sparse_r_by_agent": sparse, "shaped_r_by_agent": shaped,
-                "events": {key: torch.stack([event.get(key, false) for event in events], dim=1) for key in EVENT_TYPES},
+                "events": event_infos, "event_infos": event_infos, "sync_handoffs": handoffs,
                 "episode": {"ep_sparse_r": self._sparse_total.sum(dim=1), "ep_shaped_r": self._shaped_total.sum(dim=1),
                             "ep_sparse_r_by_agent": self._sparse_total, "ep_shaped_r_by_agent": self._shaped_total,
                             "ep_length": self.state.timestep}}
@@ -326,9 +420,7 @@ class TorchOvercookedEnv:
         return OvercookedState(players, board, bonus_orders=bonus, all_orders=allowed, timestep=timestep)
 
     def lossless_state_encoding(self):
-        """Native two-chef lossless grid as [batch, player, width, height, 26]."""
-        if self.num_players != 2:
-            raise ValueError("Native lossless encoding requires exactly two players")
+        """Native lossless grid as [batch, player, width, height, channels]."""
         positions, orientations, objects, held, timestep = self.state
         occupancy = positions[..., None] == self._cells
         facing = orientations[..., None] == self._directions
@@ -352,6 +444,10 @@ class TorchOvercookedEnv:
         dynamic.scatter_add_(2, positions[:, None].expand(-1, dynamic.shape[1], -1), layers(held, held_in_pot))
         urgency = (self.horizon - timestep < 40)[:, None, None].expand(-1, 1, len(self._cells))
         common = torch.cat((static, dynamic, urgency), dim=1)
-        views = torch.stack([torch.cat((p, h.flatten(1, 2), common), dim=1)
-                             for p, h in ((occupancy, headings), (occupancy.flip(1), headings.flip(1)))], dim=1)
-        return views.reshape(self.num_envs, 2, 26, self.height, self.width).permute(0, 1, 4, 3, 2)
+        views = torch.cat((
+            occupancy[:, self._view_order],
+            headings[:, self._view_order].flatten(2, 3),
+            common[:, None].expand(-1, self.num_players, -1, -1),
+        ), dim=2)
+        shape = (self.num_envs, self.num_players, self._observation_channels, self.height, self.width)
+        return views.reshape(shape).permute(0, 1, 4, 3, 2)
