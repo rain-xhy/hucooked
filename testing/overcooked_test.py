@@ -148,6 +148,12 @@ class TestRecipe(unittest.TestCase):
             self._expected_num_recipes(len(Recipe.ALL_INGREDIENTS), 4),
         )
 
+        Recipe.configure({})
+        self.assertEqual(
+            len(Recipe.ALL_RECIPES),
+            self._expected_num_recipes(len(Recipe.ALL_INGREDIENTS), 3),
+        )
+
     def test_invalid_input(self):
         self.assertRaises(ValueError, Recipe, [Recipe.ONION, Recipe.TOMATO, "carrot"])
         self.assertRaises(ValueError, Recipe, [Recipe.ONION] * 4)

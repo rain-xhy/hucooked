@@ -209,7 +209,11 @@ class Recipe:
         if not cls._computed:
             cls._compute_all_recipes()
             cls._computed = True
-        return set(cls.ALL_RECIPES_CACHE.values())
+        return {
+            recipe
+            for recipe in cls.ALL_RECIPES_CACHE.values()
+            if len(recipe.ingredients) <= cls.MAX_NUM_INGREDIENTS
+        }
 
     @classproperty
     def configuration(cls):
