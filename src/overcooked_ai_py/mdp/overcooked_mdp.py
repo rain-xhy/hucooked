@@ -1140,7 +1140,12 @@ class OvercookedGridworld(object):
         )
         self.layout_name = layout_name
         self.order_bonus = order_bonus
-        self.start_state = start_state
+        # A layout's serialized start state uses this MDP's recipe configuration.
+        self.start_state = (
+            OvercookedState.from_dict(start_state)
+            if isinstance(start_state, dict)
+            else start_state
+        )
         self._opt_recipe_discount_cache = {}
         self._opt_recipe_cache = {}
         self._prev_potential_params = {}
@@ -1160,11 +1165,6 @@ class OvercookedGridworld(object):
         grid = base_layout_params["grid"]
         del base_layout_params["grid"]
         base_layout_params["layout_name"] = layout_name
-        if "start_state" in base_layout_params:
-            base_layout_params["start_state"] = OvercookedState.from_dict(
-                base_layout_params["start_state"]
-            )
-
         # Clean grid
         grid = [layout_row.strip() for layout_row in grid.split("\n")]
         return OvercookedGridworld.from_grid(

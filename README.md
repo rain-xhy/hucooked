@@ -78,6 +78,39 @@ python -m unittest discover -s testing/ -p "*_test.py"
 
 See this [notebook](Overcooked%20Tutorial.ipynb) for a quick guide on getting started using the environment.
 
+### Batched kitchens on a GPU
+
+Install a CUDA-enabled PyTorch build in the environment that runs Overcooked. Pass
+`device="cuda"` to `OvercookedEnv.from_mdp` to run a batch of kitchens with the
+same layout and recipe configuration.
+
+```python
+import torch
+from overcooked_ai_py.mdp.actions import Action
+from overcooked_ai_py.mdp.overcooked_env import OvercookedEnv
+from overcooked_ai_py.mdp.overcooked_mdp import OvercookedGridworld
+
+mdp = OvercookedGridworld.from_layout_name("cramped_room")
+env = OvercookedEnv.from_mdp(mdp, horizon=400, device="cuda", num_envs=64)
+actions = torch.full(
+    (env.num_envs, mdp.num_players), Action.ACTION_TO_INDEX[Action.STAY],
+    dtype=torch.long, device=env.device,
+)
+state, reward, done, info = env.step(actions)
+obs = env.lossless_state_encoding()
+env.reset(mask=done)
+```
+
+`step` returns the sparse team reward per kitchen. The info dictionary also
+contains per-player rewards, step events, and episode totals. Finished kitchens
+wait for a reset. For two players, the lossless observation has shape
+`[num_envs, 2, width, height, 26]` and uses the native channel order.
+
+The existing CPU environment is the default when `device` is omitted. Use
+`env.to_native_state(lane)` to copy a single kitchen to the CPU for rendering or
+existing CPU agents. A custom Python `start_state_fn` also runs on the CPU when
+initializing or resetting a kitchen.
+
 ## Code Structure Overview 🗺
 
 `overcooked_ai_py` contains:

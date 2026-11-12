@@ -122,14 +122,27 @@ class OvercookedEnv(object):
         mlam_params=NO_COUNTERS_PARAMS,
         info_level=1,
         num_mdp=None,
+        *,
+        device=None,
+        num_envs=1,
     ):
         """
         Create an OvercookedEnv directly from a OvercookedGridworld mdp
         rather than a mdp generating function.
+
+        Pass a device (for example "cuda") to use the PyTorch tensor backend.
+        Its actions, observations, rewards, and done flags have a leading
+        batch dimension of num_envs.
         """
         assert isinstance(mdp, OvercookedGridworld)
         if num_mdp is not None:
             assert num_mdp == 1
+        if device is not None:
+            from overcooked_ai_py.mdp.torch_env import TorchOvercookedEnv
+
+            return TorchOvercookedEnv(mdp, horizon, device, num_envs, start_state_fn)
+        if num_envs != 1:
+            raise ValueError("Pass a device to use multiple kitchens")
         mdp_generator_fn = lambda _ignored: mdp
         return OvercookedEnv(
             mdp_generator_fn=mdp_generator_fn,
