@@ -52,6 +52,9 @@ setup(
     ],
     # removed overlapping dependencies
     extras_require={
+        "shared": [
+            "pettingzoo>=1.24.0,<2.0.0",
+        ],
         "harl": [
             "wandb",
             "GitPython",
