@@ -151,6 +151,33 @@ returns the standard PettingZoo dictionaries with NumPy observations.
 Omitting `device` selects the native CPU implementation. Use
 `TorchMixedKitchen` directly when the policy consumes batched tensors.
 
+### Three-chef SharedKitchen on a GPU
+
+Use the batched PyTorch environment for the shared kitchen with simultaneous
+two-chef unloading. It accepts the same `SharedKitchenConfig` as the native
+environment. Install PyTorch with CUDA support in your project environment.
+
+```python
+import torch
+from overcooked_ai_py.cooperative.shared import SharedKitchenConfig
+from overcooked_ai_py.cooperative.shared.torch_kitchen import TorchSharedKitchen
+
+env = TorchSharedKitchen(SharedKitchenConfig(), device="cuda", num_envs=64)
+obs, _ = env.reset(seed=42)
+actions = torch.full((64, 3), 4, dtype=torch.long, device=env.device)  # STAY
+obs, team_reward, terminated, truncated, info = env.step(actions)
+env.reset(mask=terminated | truncated)
+```
+
+Observations have shape `[num_envs, 3, features]` and follow the native
+feature order. Rewards and completion flags have one entry per kitchen.
+Finished lanes hold their final state until reset. Seeded resets use NumPy's
+native spawn permutation with seed `seed + lane`. The step transition and
+observation encoding use tensors on the selected device. Step info contains
+per-lane delivery counts, joint-unload and chop flags, and a three-chef
+unloader mask. For rendering, material lineage, snapshots and the detailed
+event log, use the native `SharedKitchen` API.
+
 ## Code Structure Overview 🗺
 
 `overcooked_ai_py` contains:
