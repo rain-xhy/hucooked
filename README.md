@@ -178,6 +178,71 @@ per-lane delivery counts, joint-unload and chop flags, and a three-chef
 unloader mask. For rendering, material lineage, snapshots and the detailed
 event log, use the native `SharedKitchen` API.
 
+### PartitionKitchen
+
+[v3 三人隔墙厨房 · 中文使用说明](v3.md)
+
+Three chefs work across a sealed wall on a 13×7 map. Both sides have two cutting
+boards, a pot and a delivery point. The left side supplies tomatoes and potatoes,
+the right side eggs and beef. A seed selects one left and two distinct right
+spawn cells, permutes chef identities and samples orientations. Independent order
+and spawn streams allow paired evaluation across the two layouts.
+
+| Recipe | Ingredients | Delivery | Deadline |
+| --- | --- | --- | ---: |
+| Tomato and egg | Chopped tomato, egg | Right | 80 |
+| Potato | Chopped potato | Left | 60 |
+| Potato, tomato and beef | Chopped potato, chopped tomato, beef | Left | 100 |
+
+Three tickets are always visible. Delivery consumes the oldest matching ticket.
+Each delivered or expired ticket is replaced by an independent uniform draw.
+The final tick of a ticket is usable. Each correct delivery scores 20 by default.
+Orders outstanding at the 300-step horizon are reported separately in evaluation.
+
+All chefs use the native six actions (north, south, east, west, stay, interact).
+Place vegetables, interact empty-handed for two consecutive ticks, then take
+them. Deposit ingredients into a pot and interact empty-handed for four
+consecutive ticks to cook a complete recipe. The first tending tick locks the
+recipe. Another chef can take over. Missing a tick resets unfinished progress.
+Take the finished meal empty-handed and deliver it directly.
+
+```python
+import torch
+from overcooked_ai_py.cooperative.partition import PartitionConfig, PartitionKitchen, TorchPartitionKitchen
+from overcooked_ai_py.cooperative.partition.parallel import ParallelPartitionKitchen
+
+config = PartitionConfig(layout="sync")  # "counter" enables all five storage slots
+native = PartitionKitchen(config)
+obs, _ = native.reset(seed=42)
+obs, reward, terminated, truncated, info = native.step([4, 4, 4])
+env = TorchPartitionKitchen(config, device="cuda", num_envs=64)
+obs, _ = env.reset(seed=42)
+actions = torch.full((64, 3), 4, dtype=torch.long, device=env.device)
+obs, rewards, terminated, truncated, info = env.step(actions)
+env.reset(mask=truncated)
+```
+
+The tensor API returns float32 observations of shape `[batch, 3, 46]`, a team
+reward per lane, and per-lane flags. Finished lanes freeze until reset. The
+native PettingZoo parallel API uses agent names `chef_0`, `chef_1`, `chef_2`.
+Observations encode layout, time, poses, hands, station contents and progress,
+wall storage, ticket recipes, time left, delivery sides and observer identity.
+Step info reports the **pre-step** ticket IDs and recipes with per-slot delivery
+and expiry flags. Order age is measured from issue to the end of this step.
+
+From the repository root with its Python environment active:
+
+```powershell
+python scripts/evaluate_partition_kitchen.py --episodes 30 --seed 0 --traces demo_outputs/partition/traces
+python scripts/train_partition_imitation.py --train-episodes 32 --eval-episodes 30
+$env:OVERCOOKED_TEST_DEVICE = 'cuda'
+python -m unittest testing.partition_kitchen_test
+```
+
+Trace files contain the reset seed and every joint action up to the identified
+delivery. The evaluator accepts a custom `policy_factory(env)` returning an
+object with `actions()` for evaluation with the same metrics and seeds.
+
 ## Code Structure Overview 🗺
 
 `overcooked_ai_py` contains:
