@@ -12,6 +12,8 @@ NORTH, SOUTH, EAST, WEST, STAY, INTERACT = range(6)
 DIRECTIONS = ((0, -1), (0, 1), (1, 0), (-1, 0))
 ITEM_KINDS = (None, "raw_main", "raw_side", "chopped_side", "cooked_main", "plate", "meal")
 ORDER_STATUSES = ("queued", "active", "started", "served")
+MIXED_ORDER_OBSERVATION_SLOTS = 8
+COMPACT_ORDER_SNAPSHOT_FINGERPRINT = "55ee61adaeaf1e946b3f06380b05ce260e84b392f1add5cc5fd3f1e1f5cff0b4"
 FIXED_ORDER_SNAPSHOT_FINGERPRINTS = (
     "a535f64e626888a63c33a07f6fccf723cee2133625d21badd09fccbbad7837ec",
     "4063de4b4a00b59041702d301c9d0faa5252f5b373e794268f0914afe51492d6",
@@ -333,13 +335,24 @@ class SharedKitchen:
         slot = -1 if item is None else order_slots.get(item.order_id, -1)
         return [float(kind == candidate) for candidate in ITEM_KINDS] + [float(slot == i) for i in range(-1, slot_count)]
 
+    def _observed_orders(self, state):
+        orders = state.orders
+        if not self.config.continuous_orders:
+            return orders
+        slot_count = max(MIXED_ORDER_OBSERVATION_SLOTS, self.config.active_limit)
+        slots = orders[:slot_count]
+        for order_id in range(len(slots), slot_count):
+            slots.append(Ticket(order_id, ("normal", "joint")[order_id % 2]))
+        for order in orders[slot_count:]:
+            reusable = (index for index, ticket in enumerate(slots) if 0 <= ticket.completed_at <= order.released_at)
+            index = min(reusable, key=lambda index: slots[index].id)
+            slots[index] = order
+        return slots
+
     def centralized_state(self):
         state = self.state
-        orders = state.orders
+        orders = self._observed_orders(state)
         slot_count = len(orders)
-        if self.config.continuous_orders:
-            orders = [order for order in orders if order.status != "served"]
-            slot_count = self.config.active_limit
         order_slots = {order.id: slot for slot, order in enumerate(orders)}
         values = [state.tick / self.config.horizon]
         for row in LAYOUT:
@@ -357,7 +370,6 @@ class SharedKitchen:
             values.extend(float(order.status == status) for status in ORDER_STATUSES)
             values.extend(float(order.kind == kind) for kind in ("normal", "joint"))
             values.extend((max(order.released_at, 0) / self.config.horizon, max(order.started_at, 0) / self.config.horizon))
-        values.extend([0.0] * ((slot_count - len(orders)) * (len(ORDER_STATUSES) + 4)))
         return np.asarray(values, dtype=np.float32)
 
     def observations(self):
@@ -376,7 +388,7 @@ class SharedKitchen:
     def restore(self, snapshot):
         fingerprint = snapshot.get("fingerprint")
         previous_fixed = not self.config.continuous_orders and fingerprint in FIXED_ORDER_SNAPSHOT_FINGERPRINTS
-        if snapshot.get("version") != 1 or (not previous_fixed and fingerprint != self.fingerprint()):
+        if snapshot.get("version") != 1 or (not previous_fixed and fingerprint not in (COMPACT_ORDER_SNAPSHOT_FINGERPRINT, self.fingerprint())):
             raise ValueError("Incompatible snapshot")
         if SharedKitchenConfig(**snapshot["config"]) != self.config:
             raise ValueError("Snapshot configuration does not match")

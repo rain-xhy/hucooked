@@ -9,6 +9,7 @@ import numpy as np
 from overcooked_ai_py.cooperative.shared import EAST, INTERACT, NORTH, SOUTH, STAY, WEST, SharedKitchen, SharedKitchenConfig
 from overcooked_ai_py.cooperative.shared.controller import ScriptedController, navigation_action
 from overcooked_ai_py.cooperative.shared.layouts import COOKER_PORTS, FLOOR, LAYOUT, STATIONS
+from overcooked_ai_py.cooperative.shared.model import Ticket
 
 
 def act(env, chef_id, action):
@@ -91,13 +92,20 @@ class SharedKitchenTests(unittest.TestCase):
 
     def test_continuous_orders_continue_past_eight_and_stop_at_horizon(self):
         env = SharedKitchen(SharedKitchenConfig(shuffle_players=False))
+        fixed = SharedKitchen(SharedKitchenConfig(normal_orders=4, joint_orders=4, shuffle_players=False))
         controller = ScriptedController(env)
-        initial_shape = env.centralized_state().shape
+        initial_shape = fixed.centralized_state().shape
+        self.assertEqual(initial_shape, (863,))
+        np.testing.assert_array_equal(env.observations(), fixed.observations())
         stepped_past_eight = False
         while not (env.terminated or env.truncated):
-            _, _, terminated, truncated, info = env.step(controller.actions(env))
+            actions = controller.actions(env)
+            _, _, terminated, truncated, info = env.step(actions)
             self.assertFalse(terminated)
             self.assertEqual(env.centralized_state().shape, initial_shape)
+            if len(env.state.orders) <= 8:
+                fixed.step(actions)
+                np.testing.assert_array_equal(env.observations(), fixed.observations())
             if info["metrics"]["meals_completed"] == 8 and not stepped_past_eight:
                 self.assertFalse(truncated)
                 outstanding = [order for order in env.state.orders if order.status != "served"]
@@ -124,6 +132,17 @@ class SharedKitchenTests(unittest.TestCase):
         self.assertEqual(exact.state.score, 20)
         self.assertEqual(len(exact.state.orders), exact.config.active_limit)
         self.assertEqual(exact.centralized_state().shape, initial_shape)
+
+    def test_observation_reuses_served_slots_without_moving_a_started_order(self):
+        env = SharedKitchen()
+        env.state.orders = [Ticket(0, "normal", status="started", released_at=0)]
+        for order_id in range(1, 10):
+            kind = ("normal", "joint")[order_id % 2]
+            env.state.orders.append(Ticket(order_id, kind, status="served",
+                                           released_at=order_id - 1, completed_at=order_id))
+        env.state.orders.append(Ticket(10, "normal", status="active", released_at=9))
+        slots = env._observed_orders(env.state)
+        self.assertEqual([order.id for order in slots], [0, 8, 9, 10, 4, 5, 6, 7])
 
     def test_normal_only_and_joint_only(self):
         for normal, joint in ((3, 0), (0, 3)):
