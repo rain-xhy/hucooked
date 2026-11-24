@@ -75,7 +75,7 @@ class SharedKitchenTests(unittest.TestCase):
             self.assertEqual(seen, available)
 
     def test_full_mixed_episode_from_empty(self):
-        env, controller, trace = rollout()
+        env, controller, trace = rollout(SharedKitchenConfig(normal_orders=4, joint_orders=4))
         self.assertTrue(env.terminated)
         self.assertFalse(env.truncated)
         self.assertEqual(env.state.score, 160)
@@ -88,6 +88,42 @@ class SharedKitchenTests(unittest.TestCase):
             self.assertEqual(order.side_prepared_by, (controller.side,))
             self.assertEqual(len(order.unloaded_by), 1 if order.kind == "normal" else 2)
         self.assertTrue(any(env.state.orders[i + 1].started_at < env.state.orders[i].completed_at for i in range(7)))
+
+    def test_continuous_orders_continue_past_eight_and_stop_at_horizon(self):
+        env = SharedKitchen(SharedKitchenConfig(shuffle_players=False))
+        controller = ScriptedController(env)
+        initial_shape = env.centralized_state().shape
+        stepped_past_eight = False
+        while not (env.terminated or env.truncated):
+            _, _, terminated, truncated, info = env.step(controller.actions(env))
+            self.assertFalse(terminated)
+            self.assertEqual(env.centralized_state().shape, initial_shape)
+            if info["metrics"]["meals_completed"] == 8 and not stepped_past_eight:
+                self.assertFalse(truncated)
+                outstanding = [order for order in env.state.orders if order.status != "served"]
+                self.assertEqual(len(outstanding), env.config.active_limit)
+                restored = SharedKitchen(env.config)
+                restored.restore(json.loads(json.dumps(env.snapshot())))
+                np.testing.assert_array_equal(restored.centralized_state(), env.centralized_state())
+                stepped_past_eight = True
+        self.assertTrue(stepped_past_eight)
+        self.assertTrue(env.truncated)
+        self.assertEqual(env.state.tick, 300)
+        self.assertGreater(info["metrics"]["meals_completed"], 8)
+        self.assertEqual(info["metrics"]["team_score"], 20 * info["metrics"]["meals_completed"])
+        self.assertEqual(info["metrics"]["joint_wait_steps"],
+                         info["metrics"]["joint_ready_steps"] - info["metrics"]["joint_successes"])
+        self.assertGreater(info["metrics"]["joint_wait_steps"], 0)
+        self.assertNotIn("completion_rate", info["metrics"])
+        self.assertEqual([order.kind for order in env.state.orders[:10]], ["normal", "joint"] * 5)
+
+        first_delivery_tick = env.state.orders[0].completed_at
+        exact, _, _ = rollout(SharedKitchenConfig(horizon=first_delivery_tick, shuffle_players=False))
+        self.assertTrue(exact.truncated)
+        self.assertFalse(exact.terminated)
+        self.assertEqual(exact.state.score, 20)
+        self.assertEqual(len(exact.state.orders), exact.config.active_limit)
+        self.assertEqual(exact.centralized_state().shape, initial_shape)
 
     def test_normal_only_and_joint_only(self):
         for normal, joint in ((3, 0), (0, 3)):

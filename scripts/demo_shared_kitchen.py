@@ -26,8 +26,8 @@ def run(output, seed):
         actions = controller.actions(env)
         _, reward, _, _, info = env.step(actions)
         trace.append({"tick": env.state.tick, "actions": actions, "team_reward": reward, "events": info["events"]})
-    if not env.terminated:
-        raise RuntimeError("The mixed-order example did not finish")
+    if not env.truncated or not all(info["metrics"][key] for key in ("normal_completed", "joint_completed")):
+        raise RuntimeError("The mixed-order example did not reach the time limit with both types of deliveries")
     save_frame(env, output / "completed.png")
     summary = {"controller": "scripted", "seed": seed, "config": asdict(env.config), "fingerprint": env.fingerprint(), "metrics": info["metrics"], "orders": info["orders"]}
     (output / "mixed_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")

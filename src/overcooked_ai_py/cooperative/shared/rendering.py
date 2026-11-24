@@ -66,9 +66,24 @@ def render(env):
     canvas.fill((242, 245, 250))
     canvas.blit(image, (0, 80))
     title = "三人共享厨房" if chinese else "Three-chef shared kitchen"
-    canvas.blit(font.render(title, True, (32, 45, 65)), (12, 6))
-    status = "step {} / {}    score {}    normal {}    joint {}".format(state.tick, env.config.horizon, state.score, state.metrics["normal_completed"], state.metrics["joint_completed"])
-    canvas.blit(small.render(status, True, (32, 45, 65)), (12, 30))
+    canvas.blit(font.render(title, True, (32, 45, 65)), (12, 3))
+    metrics = env.episode_metrics()
+    ticks = f'{metrics["ticks"]}/{env.config.horizon}'
+    score = metrics["team_score"]
+    total, normal, joint = (metrics[key] for key in ("meals_completed", "normal_completed", "joint_completed"))
+    if chinese:
+        status = f"步数 {ticks}    团队得分 {score:g}    出餐 {total}（普通 {normal} / 协作 {joint}）"
+    else:
+        status = f"Step {ticks}    Team score {score:g}    Meals {total} (normal {normal} / joint {joint})"
+    canvas.blit(small.render(status, True, (32, 45, 65)), (12, 25))
+    attempts = metrics["joint_attempt_steps"]
+    if attempts:
+        sync = f'{metrics["joint_attempt_success_rate"]:.1%} ({metrics["joint_successes"]}/{attempts})'
+    else:
+        sync = "暂无尝试" if chinese else "no attempts"
+    wait = metrics["joint_wait_steps"]
+    sync_status = f"同步出锅成功率 {sync}    同步等待 {wait} 步" if chinese else f"Sync success {sync}    Sync waiting {wait} steps"
+    canvas.blit(small.render(sync_status, True, (32, 45, 65)), (12, 43))
     legend = "M=主料  L=配菜  D=餐盘  F=成品；紫框为左右出锅位" if chinese else "M=main  L=side  D=plate  F=meal; purple=unload positions"
-    canvas.blit(small.render(legend, True, (32, 45, 65)), (12, 54))
+    canvas.blit(small.render(legend, True, (32, 45, 65)), (12, 61))
     return np.asarray(pygame.surfarray.array3d(canvas)).transpose(1, 0, 2).copy()

@@ -12,6 +12,10 @@ NORTH, SOUTH, EAST, WEST, STAY, INTERACT = range(6)
 DIRECTIONS = ((0, -1), (0, 1), (1, 0), (-1, 0))
 ITEM_KINDS = (None, "raw_main", "raw_side", "chopped_side", "cooked_main", "plate", "meal")
 ORDER_STATUSES = ("queued", "active", "started", "served")
+FIXED_ORDER_SNAPSHOT_FINGERPRINTS = (
+    "a535f64e626888a63c33a07f6fccf723cee2133625d21badd09fccbbad7837ec",
+    "4063de4b4a00b59041702d301c9d0faa5252f5b373e794268f0914afe51492d6",
+)
 
 
 def participants(*groups):
@@ -36,11 +40,12 @@ class SharedKitchen:
             positions = [SPAWNS[int(i)] for i in self.rng.permutation(3)]
         chefs = [Chef(positions[i] if i in self.active else None) for i in range(3)]
         kinds = []
-        for index in range(max(self.config.normal_orders, self.config.joint_orders)):
-            if index < self.config.normal_orders:
-                kinds.append("normal")
-            if index < self.config.joint_orders:
-                kinds.append("joint")
+        if not self.config.continuous_orders:
+            for index in range(max(self.config.normal_orders, self.config.joint_orders)):
+                if index < self.config.normal_orders:
+                    kinds.append("normal")
+                if index < self.config.joint_orders:
+                    kinds.append("joint")
         self.state = KitchenState(chefs, [Ticket(i, kind) for i, kind in enumerate(kinds)])
         self._release(self.state)
         self.validate_state()
@@ -48,6 +53,12 @@ class SharedKitchen:
 
     def _release(self, state):
         count = sum(order.status in ("active", "started") for order in state.orders)
+        if self.config.continuous_orders:
+            for _ in range(self.config.active_limit - count):
+                order_id = len(state.orders)
+                kind = ("normal", "joint")[order_id % 2]
+                state.orders.append(Ticket(order_id, kind, status="active", released_at=state.tick))
+            return
         for order in state.orders:
             if count >= self.config.active_limit:
                 break
@@ -58,7 +69,7 @@ class SharedKitchen:
 
     @property
     def terminated(self):
-        return all(order.status == "served" for order in self.state.orders)
+        return not self.config.continuous_orders and all(order.status == "served" for order in self.state.orders)
 
     @property
     def truncated(self):
@@ -295,28 +306,41 @@ class SharedKitchen:
         for i in self.active:
             state.chefs[i].position = old.chefs[i].position if i in blocked else desired[i]
 
-    def _info(self, events, reward):
+    def episode_metrics(self):
         state = self.state
         count = state.metrics["normal_completed"] + state.metrics["joint_completed"]
         metrics = dict(state.metrics)
         metrics.update({
             "team_score": state.score,
             "meals_completed": count,
-            "orders_total": len(state.orders),
             "ticks": state.tick,
-            "completion_rate": count / len(state.orders),
             "joint_attempt_success_rate": state.metrics["joint_successes"] / state.metrics["joint_attempt_steps"] if state.metrics["joint_attempt_steps"] else 0.0,
+            "joint_wait_steps": state.metrics["joint_ready_steps"] - state.metrics["joint_successes"],
             "three_contributor_meals": sum(len(order.contributors) == 3 for order in state.orders if order.status == "served"),
         })
-        return {"events": events, "metrics": metrics, "team_reward": reward, "orders": [asdict(order) for order in state.orders]}
+        if self.config.continuous_orders:
+            metrics["meals_per_100_steps"] = 100.0 * count / max(state.tick, 1)
+        else:
+            metrics["orders_total"] = len(state.orders)
+            metrics["completion_rate"] = count / len(state.orders)
+        return metrics
 
-    def _item_features(self, item):
+    def _info(self, events, reward):
+        return {"events": events, "metrics": self.episode_metrics(), "team_reward": reward, "orders": [asdict(order) for order in self.state.orders]}
+
+    def _item_features(self, item, order_slots, slot_count):
         kind = None if item is None else item.kind
-        order_id = -1 if item is None else item.order_id
-        return [float(kind == candidate) for candidate in ITEM_KINDS] + [float(order_id == i) for i in range(-1, len(self.state.orders))]
+        slot = -1 if item is None else order_slots.get(item.order_id, -1)
+        return [float(kind == candidate) for candidate in ITEM_KINDS] + [float(slot == i) for i in range(-1, slot_count)]
 
     def centralized_state(self):
         state = self.state
+        orders = state.orders
+        slot_count = len(orders)
+        if self.config.continuous_orders:
+            orders = [order for order in orders if order.status != "served"]
+            slot_count = self.config.active_limit
+        order_slots = {order.id: slot for slot, order in enumerate(orders)}
         values = [state.tick / self.config.horizon]
         for row in LAYOUT:
             for tile in row:
@@ -325,14 +349,15 @@ class SharedKitchen:
             values.append(float(i in self.active))
             values.extend(float(chef.position == (x, y)) for y in range(7) for x in range(7))
             values.extend(float(chef.orientation == direction) for direction in DIRECTIONS)
-            values.extend(self._item_features(chef.held))
+            values.extend(self._item_features(chef.held, order_slots, slot_count))
         for item in (state.cooker.item, state.cutting.item, state.assembly.main, state.assembly.side, state.assembly.plate, state.buffer):
-            values.extend(self._item_features(item))
+            values.extend(self._item_features(item, order_slots, slot_count))
         values.extend((state.cooker.remaining / self.config.cook_steps, state.cutting.progress / self.config.chop_steps))
-        for order in state.orders:
+        for order in orders:
             values.extend(float(order.status == status) for status in ORDER_STATUSES)
             values.extend(float(order.kind == kind) for kind in ("normal", "joint"))
             values.extend((max(order.released_at, 0) / self.config.horizon, max(order.started_at, 0) / self.config.horizon))
+        values.extend([0.0] * ((slot_count - len(orders)) * (len(ORDER_STATUSES) + 4)))
         return np.asarray(values, dtype=np.float32)
 
     def observations(self):
@@ -345,10 +370,13 @@ class SharedKitchen:
     @staticmethod
     def fingerprint():
         root = Path(__file__).parent
-        return sha256(b"".join((root / name).read_bytes() for name in ("model.py", "layouts.py", "kitchen.py"))).hexdigest()
+        sources = ((root / name).read_bytes().replace(b"\r\n", b"\n") for name in ("model.py", "layouts.py", "kitchen.py"))
+        return sha256(b"".join(sources)).hexdigest()
 
     def restore(self, snapshot):
-        if snapshot.get("version") != 1 or snapshot.get("fingerprint") != self.fingerprint():
+        fingerprint = snapshot.get("fingerprint")
+        previous_fixed = not self.config.continuous_orders and fingerprint in FIXED_ORDER_SNAPSHOT_FINGERPRINTS
+        if snapshot.get("version") != 1 or (not previous_fixed and fingerprint != self.fingerprint()):
             raise ValueError("Incompatible snapshot")
         if SharedKitchenConfig(**snapshot["config"]) != self.config:
             raise ValueError("Snapshot configuration does not match")
@@ -388,9 +416,13 @@ class SharedKitchen:
             require(chef.orientation in DIRECTIONS, "Invalid orientation")
             if i not in self.active:
                 require(chef.position is None and chef.held is None, "Inactive chef has state")
-        expected = self.config.normal_orders + self.config.joint_orders
-        require(len(state.orders) == expected, "Invalid order count")
-        require(sum(order.kind == "normal" for order in state.orders) == self.config.normal_orders, "Invalid recipe counts")
+        order_count = len(state.orders)
+        if self.config.continuous_orders:
+            require(all(order.status != "queued" and order.kind == ("normal", "joint")[index % 2]
+                        for index, order in enumerate(state.orders)), "Invalid continuous order sequence")
+        else:
+            require(order_count == self.config.normal_orders + self.config.joint_orders, "Invalid order count")
+            require(sum(order.kind == "normal" for order in state.orders) == self.config.normal_orders, "Invalid recipe counts")
         live = [chef.held for chef in state.chefs] + [state.cooker.item, state.cutting.item, state.assembly.main, state.assembly.side, state.assembly.plate, state.buffer]
         units = []
         for value in live:
@@ -404,7 +436,7 @@ class SharedKitchen:
             require(all(i in self.active for i in value.contributors + value.prepared_by), "Invalid contributors")
             require(tuple(sorted(set(value.contributors))) == value.contributors and tuple(sorted(set(value.prepared_by))) == value.prepared_by, "Duplicate contributors")
             if value.kind in ("cooked_main", "meal") or value is state.cooker.item:
-                require(0 <= value.order_id < expected and state.orders[value.order_id].status == "started", "Invalid main order")
+                require(0 <= value.order_id < order_count and state.orders[value.order_id].status == "started", "Invalid main order")
             else:
                 require(value.order_id == -1, "Unexpected order association")
             units.extend(value.units)
@@ -417,7 +449,10 @@ class SharedKitchen:
         table = state.assembly
         for value, allowed in ((table.main, ("cooked_main",)), (table.side, ("chopped_side",)), (table.plate, ("plate", "meal"))):
             require(value is None or value.kind in allowed, "Invalid assembly slot")
-        require(sum(order.status in ("active", "started") for order in state.orders) <= self.config.active_limit, "Too many active orders")
+        active_count = sum(order.status in ("active", "started") for order in state.orders)
+        require(active_count <= self.config.active_limit, "Too many active orders")
+        if self.config.continuous_orders and state.tick < self.config.horizon:
+            require(active_count == self.config.active_limit, "Missing continuous orders")
         for index, order in enumerate(state.orders):
             require(order.id == index and order.kind in ("normal", "joint") and order.status in ORDER_STATUSES, "Invalid order")
             mains = [value for value in live if value is not None and value.order_id == index]

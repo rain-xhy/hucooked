@@ -5,8 +5,8 @@ import math
 @dataclass(frozen=True)
 class SharedKitchenConfig:
     horizon: int = 300
-    normal_orders: int = 4
-    joint_orders: int = 4
+    normal_orders: int | None = None
+    joint_orders: int | None = None
     active_limit: int = 2
     cook_steps: int = 4
     chop_steps: int = 2
@@ -20,12 +20,15 @@ class SharedKitchenConfig:
             value = getattr(self, name)
             if type(value) is not int or value < 1:
                 raise ValueError(name + " must be a positive integer")
-        for name in ("normal_orders", "joint_orders"):
-            value = getattr(self, name)
-            if type(value) is not int or value < 0:
-                raise ValueError(name + " must be a nonnegative integer")
-        if not 1 <= self.normal_orders + self.joint_orders <= 64:
-            raise ValueError("The episode must have between 1 and 64 orders")
+        if not self.continuous_orders:
+            for name in ("normal_orders", "joint_orders"):
+                value = getattr(self, name)
+                if value is None:
+                    object.__setattr__(self, name, 4)
+                elif type(value) is not int or value < 0:
+                    raise ValueError(name + " must be a nonnegative integer")
+            if not 1 <= self.normal_orders + self.joint_orders <= 64:
+                raise ValueError("A fixed episode must have between 1 and 64 orders")
         for name in ("normal_reward", "joint_reward"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
@@ -36,6 +39,10 @@ class SharedKitchenConfig:
         if not players or any(type(i) is not int or i not in (0, 1, 2) for i in players) or len(set(players)) != len(players):
             raise ValueError("active_players must contain unique player IDs from 0, 1, 2")
         object.__setattr__(self, "active_players", tuple(sorted(players)))
+
+    @property
+    def continuous_orders(self):
+        return self.normal_orders is None and self.joint_orders is None
 
 
 @dataclass(frozen=True)
